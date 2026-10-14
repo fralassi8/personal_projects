@@ -37,7 +37,7 @@ library(gbm)
 library(xgboost)          
 
 #### Load functions
-source("data/Data-original.txt")
+source("data/Data-functions.R")
 
 ## Some functions
 
@@ -65,11 +65,11 @@ source("data/Data-original.txt")
 
 ```{r}
 #### Original data
-file <- "C:/Users/franc/OneDrive/Documenti/Francesco Lassi UniFi/Economics/Terzo anno Economics- Erasmus/Secondo semestre/Data Science for Economics/LassiFrancesco Data Report/Data-original.txt"
+file <- "data/Data-original.txt"
 data <- read.table(file = file, header = TRUE, sep = "\t", na.strings = ".")
 head(data, 3) 
 #### Live data
-file <- "C:/Users/franc/OneDrive/Documenti/Francesco Lassi UniFi/Economics/Terzo anno Economics- Erasmus/Secondo semestre/Data Science for Economics/LassiFrancesco Data Report/Data-live.txt"
+file <- "data/Data-live.txt"
 data.live <- read.table(file = file, header = TRUE, sep = "\t", na.strings = ".")
 head(data.live, 3)
 
