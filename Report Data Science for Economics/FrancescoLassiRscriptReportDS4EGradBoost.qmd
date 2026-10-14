@@ -1,0 +1,229 @@
+---
+title: "Prediction of the timely payment of the 13M insurance premium (Gradient Boosting)"
+author: "Francesco Lassi"
+format: html
+editor: visual
+date: 2024-08-01
+number-sections: true
+toc: true
+toc-location: body
+toc-depth: 4
+editor_options: 
+  chunk_output_type: console
+---
+
+## Preliminaries
+
+```{r}
+#| echo: true
+#| output: false
+#### Clean memory
+rm(list = ls())
+
+#### Load libraries
+library(MASS)
+library(glmnet)
+library(car)                
+library(verification)       
+library(caret)              
+library(pROC)
+library(rpart)
+library(rattle)
+library(rpart.plot)
+library(RColorBrewer)
+library(vip)
+library(ranger)
+library(gbm)                
+library(xgboost)          
+
+#### Load functions
+source("C:/Users/franc/OneDrive/Documenti/Francesco Lassi UniFi/Economics/Terzo anno Economics- Erasmus/Secondo semestre/Data Science for Economics/R/DS4E-Functions.R")
+
+## Some functions
+
+.character.2.factor <- function(data, exclude = NULL, include = NULL)
+{
+  #### Find character vars
+  ind <- mapply(FUN = is.character, x = data)
+  #### Exclude vars in 'exclude'
+  ind <- ind & !( colnames(data) %in% exclude )
+  #### Include vars in 'include'
+  ind <- ind | colnames(data) %in% include
+  #### Cycle across vars to convert
+  ind <- which(ind)
+  for (ind1 in ind)
+  {
+    data[, ind1] <- factor(data[, ind1])
+  }
+  #### Answer
+  data
+}
+
+```
+
+## Read data
+
+```{r}
+#### Original data
+file <- "C:/Users/franc/OneDrive/Documenti/Francesco Lassi UniFi/Economics/Terzo anno Economics- Erasmus/Secondo semestre/Data Science for Economics/LassiFrancesco Data Report/Data-original.txt"
+data <- read.table(file = file, header = TRUE, sep = "\t", na.strings = ".")
+head(data, 3) 
+#### Live data
+file <- "C:/Users/franc/OneDrive/Documenti/Francesco Lassi UniFi/Economics/Terzo anno Economics- Erasmus/Secondo semestre/Data Science for Economics/LassiFrancesco Data Report/Data-live.txt"
+data.live <- read.table(file = file, header = TRUE, sep = "\t", na.strings = ".")
+head(data.live, 3)
+
+#### Adjust
+## data
+data1 <- data
+data1$VAR21 <- recode(data1$VAR21, "'Student'='Others';'Housewife'='Others'")
+data1$VAR29 <- as.factor(data1$VAR29)
+data1$VAR32 <- as.factor(data1$VAR32)
+data1$VAR38f <- factor(x = data1$VAR38)
+data <- data1
+## data.live
+data1 <- data.live
+data1$VAR21 <- recode(data1$VAR21, "'Student'='Others';'Housewife'='Others'")
+data1$VAR29 <- as.factor(data1$VAR29)
+data1$VAR32 <- as.factor(data1$VAR32)
+data.live <- data1
+
+data <- .character.2.factor(data = data, exclude = NULL, include = NULL)
+data.live <- .character.2.factor(data = data.live, exclude = NULL, include = NULL)
+```
+
+## Explore Data
+
+### Synthetic Analysis
+
+```{r}
+dim(data)         ## rows x cols
+colnames(data)    ## Names of the columns
+head(data, 3)     ## First 3 lines
+tail(data, 2)     ## Last 2 lines
+str(data)         ## Structure
+summary(data)     ## Summary
+```
+
+## Train/test sets split
+
+```{r}
+
+set.seed(1234)
+
+n.test <- 0.20 * NROW(data)
+
+ind <- sample(x = 1:NROW(data), size = n.test)
+
+data.orig <- data                         
+data.test <- data[ind, , drop = FALSE]    
+data.train <- data[-ind, , drop = FALSE]  
+
+cat("NROW(original)", NROW(data), "NROW(train)", NROW(data.train),
+  "NROW(test)", NROW(data.test))
+```
+
+## GRADIENT BOOSTING
+
+```{r}
+formula <- VAR38 ~ VAR5 + VAR17 + VAR29 + VAR4 + VAR32 + VAR1 + VAR6 + VAR7 + VAR9 + VAR10 + VAR13 + VAR14 + VAR15 + VAR16 + VAR18 + VAR19 + VAR21 + VAR22 + VAR24 + VAR25 + VAR26 + VAR27 + VAR31 + VAR33 + VAR34 + VAR36 + VAR37
+```
+
+```{r}
+set.seed(1000)
+fit <- gbm(formula = formula, data = data.train, distribution = "bernoulli",
+  var.monotone = NULL, train.fraction = 0.8, cv.folds = 10,
+  interaction.depth = 3, n.minobsinnode = 10, n.trees = 2000, shrinkage = 0.05,
+  bag.fraction = 0.5,
+  keep.data = TRUE, verbose = FALSE)
+fit.gbm <- fit
+
+class(fit.gbm)
+typeof(fit.gbm)
+names(fit.gbm)
+```
+
+```{r}
+fit.gbm$initF                                     
+fit.gbm[c("bag.fraction", "distribution", "interaction.depth",
+  "n.minobsinnode", "nTrain", "n.trees", "train.fraction",
+  "shrinkage")]
+
+head(fit.gbm$fit)                                ## Fitted values (train data)
+fitted <- predict(object = fit.gbm, newdata = data.train,
+  n.trees = fit$n.trees, type = "response",
+  single.tree = FALSE)
+head(fitted)
+```
+
+```{r}
+par(mar = c(4, 9, 0.5, 0.5))
+plot(x = fit.gbm, i.var = "VAR29")                
+plot(x = fit.gbm, i.var = "VAR4")
+plot(x = fit.gbm, i.var = "VAR5")
+plot(x = fit.gbm, i.var = "VAR17")
+```
+
+## Clues to optimize: the error analysis
+
+```{r}
+par(mar = c(2, 2, 0.5, 0.5))
+head(fit.gbm$train.error)
+plot(x = fit.gbm$train.error, xlab = "Iteration", ylab = "Cross Entropy", type = "l")
+head(fit.gbm$valid.error)
+lines(x = fit.gbm$valid.error, xlab = "Iteration", type = "l", col = "red")
+head(fit.gbm$cv.error)
+lines(x = fit.gbm$cv.error, xlab = "Iteration", type = "l", col = "green")
+abline(v = which.min(fit.gbm$cv.error), col = "blue", lty = 2, lwd = 2)
+```
+
+```{r}
+n.trees.best <- gbm.perf(object = fit.gbm,
+  plot.it = TRUE, oobag.curve = FALSE, overlay = FALSE,
+  method = "cv")
+legend(x = "topright",
+  legend = c("Train error", "Validation error", "CV error", "Best CV n.trees choice"),
+  col = c("black", "red", "green", "blue"),
+  lty = c(1, 1, 1, 2), lwd = c(1, 1, 1, 2),
+  fill = NULL, border = "white", pch = NULL, bty = "o")
+n.trees.best
+n.trees.best1 <- n.trees.best
+```
+
+```{r}
+cat("train: min error = ", min(fit.gbm$train.error), ", n.trees = ",
+  which.min(fit.gbm$train.error), sep = "")
+cat("validation: min error = ", min(fit.gbm$valid.error), ", n.trees = ",
+  which.min(fit.gbm$valid.error), sep = "")
+cat("CV: min error = ", min(fit.gbm$cv.error), ", n.trees = ",
+  which.min(fit.gbm$cv.error), sep = "")
+```
+
+## Model perfomance evaluation (probaility based)
+
+```{r}
+data <- data.test
+y <- data$VAR38
+
+fit.stats <- rbind(
+  GBM = .fit.stats.bin(fit = fit.gbm, y = y, x = data, n.trees = n.trees.best1))
+fit.stats
+```
+
+## Model performance evaluation: ROC curve
+
+```{r}
+
+data <- data.test
+y <- data$VAR38
+
+pred.gbm <- predict(object = fit.gbm, newdata = data,
+  n.trees = n.trees.best1, type = "response",
+  single.tree = FALSE)
+pred <- cbind(pred.gbm)
+
+roc <- roc.plot(x = y, pred = pred,
+  xlab = "False Positive Rate", ylab = "True Positive Rate",
+  show.thres = FALSE, legend = TRUE, leg.text = c("GBM"))
+roc$roc.vol
+```

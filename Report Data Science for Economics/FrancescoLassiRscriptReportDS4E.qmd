@@ -1,0 +1,1091 @@
+---
+title: "Prediction of the timely payment of the 13M insurance premium."
+author: "Francesco Lassi"
+format: html
+editor: visual
+date: 2024-08-01
+number-sections: true
+toc: true
+toc-location: body
+toc-depth: 4
+editor_options: 
+  chunk_output_type: console
+---
+
+## Preliminaries
+
+```{r}
+#| echo: true
+#| output: false
+#### Clean memory
+rm(list = ls())
+
+#### Load libraries
+library(MASS)
+library(glmnet)
+library(car)                
+library(verification)       
+library(caret)               
+library(pROC)
+library(rpart)
+library(rattle)
+library(rpart.plot)
+library(RColorBrewer)
+library(vip)
+library(ranger)
+library(gbm)                
+library(xgboost)          
+
+#### Load functions
+source("C:/Users/franc/OneDrive/Documenti/Francesco Lassi UniFi/Economics/Terzo anno Economics- Erasmus/Secondo semestre/Data Science for Economics/R/DS4E-Functions.R")
+
+## Some functions
+#1)
+.fit.stats.bin <- function(fit, y = NULL, x = NULL, ...)
+{
+  #### Extract the class of the fitted model
+  cfit <- class(fit)
+  #### Extract the family
+  if ("glm" %in% cfit) { fam <- fit$family$family }
+  else if ("glmnet" %in% cfit)
+  { 
+    if ("classnames" %in% names(fit)) { fam <- "binomial" }
+  }
+  else 
+  {
+    fam <- ""
+  }
+}
+
+#2)
+.five.fit.stats<-function(fit)
+  
+{
+  c(R2 = summary(fit)$r.squared,
+    logLik = logLik(fit),
+    R2adj = summary(fit)$adj.r.squared,
+    AIC = AIC(fit),
+    BIC = BIC(fit))
+}
+
+#3)
+.glmnet.xmat <- function(formula, data)
+{
+  #### Extract independent variables
+  form <- strsplit(x = as.character(formula(formula)), split = "~", 
+    fixed = TRUE)[[3]]
+  #### Complete the formula
+  form <- formula(paste0(" ~ ", form))
+  #### Extract independent variables
+  model.matrix(object = form, data = data)[, -1, drop = FALSE]
+}
+
+#4)
+.cost.cutoff <- function(c01, c10 = 1, c00 = 0, c11 = 0)
+{
+  1 / (1 + (c01 - c11) / (c10 - c00) )
+}
+
+#5)
+.classify <- function(x, coff)
+{
+  as.numeric(x > coff)
+}
+
+#6)
+.plotcp <- function(x, minline = TRUE, lty = 3, col = 1,
+  upper = c("size", "splits", "none"), ...)
+{
+  dots <- list(...)
+  if (!inherits(x, "rpart")) stop("Not a legitimate \"rpart\" object")
+  upper <- match.arg(upper)
+  p.rpart <- x$cptable
+  if (ncol(p.rpart) < 5L)
+    stop("'cptable' does not contain cross-validation results")
+  xstd <- p.rpart[, 5L]
+  xerror <- p.rpart[, 4L]
+  nsplit <- p.rpart[, 2L]
+  ns <- seq_along(nsplit)
+  cp0 <- p.rpart[, 1L]
+  #### Original
+  ## cp <- sqrt(cp0 * c(Inf, cp0[-length(cp0)]))
+  #### Changed
+  cp <- cp0
+  if (! "ylim" %in% names(dots))
+    dots$ylim <- c(min(xerror - xstd) - 0.1, max(xerror + xstd) + 0.1)
+  do.call(plot, c(list(ns, xerror, axes = FALSE, xlab = "cp",
+    ylab = "X-val Relative Error", type = "o"), dots))
+  box()
+  axis(2, ...)
+  segments(ns, xerror - xstd, ns, xerror + xstd)
+  axis(1L, at = ns, labels = as.character(signif(cp, 2L)), ...)
+  switch(upper,
+    size = {
+      axis(3L, at = ns, labels = as.character(nsplit + 1), ...)
+      mtext("size of tree", side = 3, line = 3)
+    },
+    splits = {
+      axis(3L, at = ns, labels = as.character(nsplit), ...)
+      mtext("number of splits", side = 3, line = 3)
+    })
+  minpos <- min(seq_along(xerror)[xerror == min(xerror)])
+  if (minline) abline(h = (xerror + xstd)[minpos], lty = lty, col = col)
+  invisible()
+}
+.five.fit.stats<-function(fit)
+  
+{
+  c(R2 = summary(fit)$r.squared,
+    logLik = logLik(fit),
+    R2adj = summary(fit)$adj.r.squared,
+    AIC = AIC(fit),
+    BIC = BIC(fit))
+}
+
+#7)
+.features <- function(x)
+{
+  attributes(terms(formula))$term.labels
+}
+
+#8)
+.rf.errorMeasures <- function(fit, data)
+{ 
+  #### Extract
+  ## General
+  type <- fit$treetype
+  n.trees <- fit$num.trees
+  ## Prediction based
+  ib <- do.call(what = cbind, args = fit$inbag.counts)
+  ## Dependent var
+  y <- data[, fit$dependent.variable.name]
+
+  #### Make
+  fun.ce <- function(y, pred)
+  {
+    ans <- y * log(pred) + (1 - y) * log(1 - pred)
+    ans[pred < 1e-15] <- log(1e-15) 
+    ans[pred > 1 - 1e-15] <- 0
+    -mean(ans)
+  }
+    
+  ## IB/OOB
+  ob <- ib == 0
+  ib <- ib > 0
+  ##
+  if (type == "Probability estimation")
+  {
+    y <- as.numeric(levels(y))[y]
+    pred <- predict(object = fit, data = data, type = "response", 
+      predict.all = TRUE)$predictions[, "1",]
+    pred.ib  <- rowSums(pred * ib) / rowSums(ib)
+    pred.ob  <- rowSums(pred * ob) / rowSums(ob)
+    pred.all <- rowMeans(pred)
+    ans <- matrix(NA, 3, 3)
+    rownames(ans) <- c("ib", "oob", "all")
+    colnames(ans) <- c("me", "ce", "brier")
+    ans["ib",  "me"] <- mean( (y != (pred.ib > 0.5) ) )
+    ans["oob", "me"] <- mean( (y != (pred.ob > 0.5) ) )
+    ans["all", "me"] <- mean( (y != (pred.all > 0.5) ) )
+    ans["ib",  "ce"] <- fun.ce(y = y, pred = pred.ib)
+    ans["oob", "ce"] <- fun.ce(y = y, pred = pred.ob)
+    ans["all", "ce"] <- fun.ce(y = y, pred = pred.all)
+    ans["ib",  "brier"] <- mean( (y - pred.ib)^2 )
+    ans["oob", "brier"] <- mean( (y - pred.ob)^2 )
+    ans["all", "brier"] <- mean( (y - pred.all)^2 )
+  }
+  else if (type == "Regression")
+  {
+    pred <- predict(object = fit, data = data, type = "response", 
+      predict.all = TRUE)$predictions
+    pred.ib  <- rowSums(pred * ib) / rowSums(ib)
+    pred.ob  <- rowSums(pred * ob) / rowSums(ob)
+    pred.all <- rowMeans(pred)
+    ans <- matrix(NA, 3, 3)
+    rownames(ans) <- c("ib", "oob", "all")
+    colnames(ans) <- c("mse", "rmse", "mae")
+    ans["ib",  "mse"] <- mean( (y - pred.ib)^2 )
+    ans["oob", "mse"] <- mean( (y - pred.ob)^2 )
+    ans["all", "mse"] <- mean( (y - pred.all)^2 )
+    ans[, "rmse"] <- sqrt(ans[, "mse"])
+    ans["ib",  "mae"] <- mean( abs(y - pred.ib) )
+    ans["oob", "mae"] <- mean( abs(y - pred.ob) )
+    ans["all", "mae"] <- mean( abs(y - pred.all) )
+  }
+  else
+  {
+    stop("Argument 'fit' must have the $treetype component as 'Probability estimation' or 'Regression'")
+  }
+
+  #### Answer
+  ans
+}
+
+#9)
+.rf.loss <- function(y, pred, type)
+{ 
+  #### Settings
+  n.trees <- NCOL(pred)
+
+  #### Make
+  fun.ce <- function(y, pred)
+  {
+    ans <- y * log(pred) + (1 - y) * log(1 - pred)
+    ans[pred < 1e-15] <- log(1e-15) 
+    ans[pred > 1 - 1e-15] <- 0
+    -ans
+  }
+  
+  #### Type
+  if (type %in% c("me", "ce", "br"))
+  {
+    y <- as.numeric(levels(y))[y]
+    ans <- if (type == "me")
+    {
+      y != (pred > 0.5)
+    }
+    else if (type == "ce")
+    {
+      fun.ce(y = y, pred = pred)
+    }
+    else if (type == "br")
+    {
+      (y - pred)^2
+    }
+    ans <- colMeans(ans)
+  }  
+  else if (type %in% c("ms", "rm"))
+  {
+    ans <- colMeans( (y - pred)^2 )
+    if (type == "rm")
+    {
+      ans <- sqrt(ans)
+    }
+  }
+  else
+  {
+    stop("Argument 'type' must be one among 'rmse', 'mse', 'ce' or 'brier'")
+  }
+  
+  #### Answer
+  ans
+}
+
+#10)
+.rf.errorPlot <- function(fit, data, what = "oob",
+  type = c("rmse", "mse", "me", "ce", "brier"))
+{ 
+  #### Settings
+  type <- substr(type[1], 1, 2)
+  #### Dependent var
+  y <- data[, fit$dependent.variable.name]
+  #### Predictions
+  pred <- .rf.predict.cum(fit = fit, data = data.train)
+  loss <- cbind(
+    oob = .rf.loss(y = y, pred = pred$oob, type = type),
+    all = .rf.loss(y = y, pred = pred$all, type = type),
+    ib = .rf.loss(y = y, pred = pred$ib, type = type) )
+
+  #### Plot
+  ## Settings
+  ylab <- switch(type,
+    rm = "RMSE",
+    ms = "MSE",
+    me = "Misclassification Error",
+    ce = "Cross-Entropy",
+    brier = "Brier Score" )
+  x <- 1 : NROW(loss)
+  text <- c("oob", "all", "ib")
+  col <- c("green", "grey", "red")
+  names(text) <- names(col) <- text
+  ## Select
+  loss <- loss[, what, drop = FALSE]
+  text <- toupper(text[what])
+  col  <- col[what]
+  ## Make
+  matplot(x = x, y = loss, type = "l", col = col, ylab = ylab, lty = "solid", 
+    xlab = "num. trees")
+  legend(x = "topright", legend = text, fill = NULL, col = col,
+    border = "white", lty = 1, pch = NULL, bty = "o", bg = par("bg"))
+  
+  #### Answer
+  loss 
+}
+
+#11)
+.rf.varImp <- function(fit, plot = TRUE)
+{  
+  #### Importance
+  vimp <- sort(fit$variable.importance)
+  ####
+  if (plot)
+  {
+    par(mfrow = c(1,1), las = 1)
+    barplot(height = vimp, width = 1, space = NULL, horiz = TRUE, 
+      ylab = "", xlab = "importance")
+  }
+  #### Answer
+  vimp
+}
+
+#12)
+.yuden.coff <- function(x, pred)
+{
+  pred.r <- range(pred)
+  coff <- seq(from = pred.r[1], to = pred.r[2], by = 0.001)
+   #coff <- quantile(x = pred, prob = seq(from = 0, to = 1, by = 0.005),
+    # names = FALSE)
+  if (pred.r[1] > 0) { coff <- c(0, coff) }
+  if (pred.r[2] < 1) { coff <- c(coff, 1) }
+  roc <- verification::roc.plot(x = x, pred = pred, thresholds = coff, 
+    xlab = "FPR", ylab = "TPR", plot = NULL)$plot.data[, , 1]
+  yuden <- roc[, 2] - roc[, 3]
+  roc <- cbind(roc, yuden)
+  ind <- which.max(yuden)
+  roc <- as.numeric(roc[ind, ])
+  list(coff = roc[1], J = roc[6], tpr = roc[2], fpr = roc[3])
+}
+
+#13)
+.yuden.coff <- function(x, pred) {
+  # Convert factors to numeric if needed
+  if (is.factor(x)) {
+    x <- as.numeric(as.character(x))
+  }
+  if (is.factor(pred)) {
+    pred <- as.numeric(as.character(pred))
+  }
+  
+  pred.r <- range(pred)
+  coff <- seq(from = pred.r[1], to = pred.r[2], by = 0.001)
+  
+  if (pred.r[1] > 0) { coff <- c(0, coff) }
+  if (pred.r[2] < 1) { coff <- c(coff, 1) }
+  
+  roc <- verification::roc.plot(x = x, pred = pred, thresholds = coff, 
+                                xlab = "FPR", ylab = "TPR", plot = NULL)$plot.data[, , 1]
+  
+  yuden <- roc[, 2] - roc[, 3]
+  roc <- cbind(roc, yuden)
+  ind <- which.max(yuden)
+  roc <- as.numeric(roc[ind, ])
+  
+  list(coff = roc[1], J = roc[6], tpr = roc[2], fpr = roc[3])
+}
+
+#14)
+.rpart.cp.1se <- function(fit)
+{
+  ####
+  cptable <- fit$cptable
+  #### Position of min(xerror)
+  ind <- which.min(cptable[, "xerror"])
+  #### Calculation of min(xerror) + xstd
+  xerror.threshold <- cptable[ind, "xerror"] + cptable[ind, "xstd"]
+  #### Find the position of the smallest xerror among those > xerror.threshold
+  ind <- cptable[, "xerror"] > xerror.threshold
+  ind <- cptable[, "xerror"] == min(cptable[ind, "xerror"])
+  ind <- which(ind)[1]
+  #### Answer
+  fit$cptable[ind, "CP"]
+}
+
+
+
+```
+
+## Read data
+
+```{r}
+#### Original data
+file <- "C:/Users/franc/OneDrive/Documenti/Francesco Lassi UniFi/Economics/Terzo anno Economics- Erasmus/Secondo semestre/Data Science for Economics/LassiFrancesco Data Report/Data-original.txt"
+data <- read.table(file = file, header = TRUE, sep = "\t", na.strings = ".")
+head(data, 3) 
+
+#### Live data
+file <- "C:/Users/franc/OneDrive/Documenti/Francesco Lassi UniFi/Economics/Terzo anno Economics- Erasmus/Secondo semestre/Data Science for Economics/LassiFrancesco Data Report/Data-live.txt"
+data.live <- read.table(file = file, header = TRUE, sep = "\t", na.strings = ".")
+head(data.live, 3)
+
+#### Adjust
+## data
+data1 <- data
+data1$VAR21 <- recode(data1$VAR21, "'Student'='Others';'Housewife'='Others'")
+data1$VAR29 <- as.factor(data1$VAR29)
+data1$VAR32 <- as.factor(data1$VAR32)
+data1$VAR38f <- factor(x = data1$VAR38)
+data <- data1
+## data.live
+data1 <- data.live
+data1$VAR21 <- recode(data1$VAR21, "'Student'='Others';'Housewife'='Others'")
+data1$VAR29 <- as.factor(data1$VAR29)
+data1$VAR32 <- as.factor(data1$VAR32)
+data.live <- data1
+```
+
+## Explore Data
+
+### Synthetic Analysis
+
+```{r}
+dim(data)
+dim(data.live)
+colnames(data)   
+head(data, 3)    
+tail(data, 2)     
+str(data)         
+summary(data)   
+```
+
+### Analytic (columns in detail)
+
+#### Dependent variable (standalone)
+
+```{r}
+var38 <- data$VAR38
+#### Some stats
+tab <- table(var38, exclude = NULL) 
+tab
+tabp <- 100 * tab/sum(tab)        
+tabp
+
+#### Plots
+
+###BarPlot
+par(mfrow = c(1,1))
+barplot(tabp, main = "VAR38 % frequencies", ylab="Percentage frequencies", ylim=c(0,max(tabp)+40))
+barplot(tab, main = "VAR38 Absolute frequencies", ylim = c(0, max(tab)+1000))
+
+```
+
+### Independent variable (stand alone)
+
+#### VAR29 (Applicant's Policy Price Sensitivity(1-'Yes', 0-'No')- Dummy)
+
+```{r}
+
+var29<- data$VAR29
+#### Some stats
+tab <- table(var29, exclude = NULL)  
+tab
+tabp <- 100 * tab/sum(tab)        
+tabp
+#### Plot
+barplot(tabp, main = "VAR29 % frequencies", ylim=c(0,max(tabp)+40))
+```
+
+#### VAR4 (Application Life Assured Alcohol Declaration- Character)
+
+```{r}
+
+var4<- data$VAR4
+#### Some stats
+tab <- table(var4, exclude = NULL)  
+tab
+tabf <- tab/sum(tab)              
+tabf
+tabp <- 100 * tab/sum(tab)        
+tabp
+
+#### Plot
+cols<- c("blue", "red")
+labs<- c("N", "Y")
+lb <- paste(tabp, "%", sep="")
+pie(tabp, main = "VAR4 % frequencies", labels= lb, col=cols)  
+legend(0.8, 1.5, cex=0.8, legend=labs, fill=cols)
+
+```
+
+#### VAR5(Applicant's Policy Annualized Premium- Numeric)
+
+```{r}
+
+var5<- data$VAR5
+#### Some stats
+cat("min", min(var5), "max", max(var5), "mean", mean(var5), "median", median(var5), "quantile" ,quantile(var5))
+tab <- table(var5, exclude = NULL)  
+
+tabp <- 100 * tab/sum(tab)        
+
+#### Plot
+logv5 <- log(var5)
+par(mfrow = c(1,1))
+boxplot(logv5, main="LOG(VAR5)", data = data, horizontal = TRUE)
+```
+
+#### VAR17 (Application Life Assured Income- Numeric)
+
+```{r}
+#### Extract the variable
+var17<- data$VAR17
+cat("min", min(var17), "max", max(var17), "mean", mean(var17), "median", median(var17), "quantile" ,quantile(var17))
+
+#### Some stats
+tab <- table(var17, exclude = NULL)  
+
+tabp <- 100 * tab/sum(tab)        
+
+#### Plot
+par(mfrow = c(1,1))
+barplot(tabp, main = "VAR17 % frequencies", ylim=c(0,max(tabp)+10))
+```
+
+### Relationship: independent vs each independent
+
+#### Dependent vs quantitative independent
+
+```{r}
+logv5 <- log(var5)
+boxplot(formula = logv5 ~ VAR38, data = data, horizontal = TRUE, col= "yellow")
+logv17 <- log(var17)
+boxplot(formula = logv17 ~ VAR38, data = data, horizontal = TRUE, col="violet")
+```
+
+#### Dependent vs categorical independent
+
+```{r}
+ind <- c("VAR4", "VAR38")
+table(data[, ind])
+prop.table(table(data[, ind]), margin = 1)
+
+ind1 <- c("VAR29", "VAR38")
+table(data[, ind1])
+prop.table(table(data[, ind1]), margin = 1)
+```
+
+## Training/Test set splits
+
+```{r}
+set.seed(1234)
+
+n.test <- 0.20 * NROW(data)
+n.test
+round(n.test, digits=0)
+
+ind <- sample(x = 1:NROW(data), size = n.test)
+
+data.orig <- data                         
+
+data.test <- data[ind, , drop = FALSE]
+dim(data.test)
+
+data.train <- data[-ind, , drop = FALSE]
+dim(data.train)
+
+
+cat("NROW(original data)", NROW(data.orig), "NROW(train data)", NROW(data.train),
+  "NROW(test data)", NROW(data.test))
+
+general <- sum(nrow(data.test),nrow(data.train))
+general
+if (general == nrow(data)) {
+  print ("TRUE")
+}
+```
+
+## Linear regression
+
+### Manual
+
+#### Null model
+
+```{r}
+fit0 <- glm(formula = VAR38~ 1, data = data.train, family = binomial(link = "logit")) 
+
+summary(fit0) 
+R2 
+.five.fit.stats(fit0) 
+
+```
+
+#### Add some variables
+
+```{r}
+fit1 <- glm(formula = VAR38 ~ log(VAR5) + VAR17, data=data.train, family=binomial(link="logit")) 
+
+summary(fit1) 
+.five.fit.stats(fit1)
+```
+
+#### Add more variables (categorical)
+
+```{r}
+fit2 <- glm(formula = VAR38 ~ log(VAR5) + VAR17 + factor(VAR29)+ factor(VAR4), data=data.train, family=binomial(link="logit"))
+
+summary(fit2)
+.five.fit.stats(fit2)
+```
+
+#### Full model
+
+```{r}
+fit3 <- glm(formula = VAR38 ~ VAR5 + VAR17 + VAR29 + VAR4 + VAR32 + VAR1 + VAR6 + VAR7 + VAR9 + VAR10 + VAR13 + VAR14 + VAR15 + VAR16 + VAR18 + VAR19 + VAR21 + VAR22 + VAR24 + VAR25 + VAR26 + VAR27 + VAR31 + VAR33 + VAR34 + VAR36 + VAR37, data=data.train, family = binomial(link = "logit"))
+
+summary(fit3)
+.five.fit.stats(fit3) 
+```
+
+### Stepwise model selection
+
+```{r}
+k.pen <- log(NROW(data.train))  
+k.pen 
+fit.null  <- fit0
+form.null <- formula(fit.null)
+fit.full  <- fit3 
+form.full <- formula(fit.full) 
+```
+
+```{r}
+####Forward
+
+
+#fit <- step(object = fit.null, scope = list(lower = form.null, upper = form.full),direction = "forward", k = k.pen)
+
+#summary(fit)
+
+#fit$anova
+
+#fit.forw <- fit
+```
+
+```{r}
+####Backward
+
+
+#fit <- step(object = fit.full, scope = list(lower = form.null, upper = form.full), direction = "backward", k = k.pen)
+
+#summary(fit)
+
+#fit$anova
+
+#fit.back <- fit 
+```
+
+#### Both
+
+```{r}
+fit <- step(object = fit.null,  scope = list(lower = form.null, upper = form.full), direction = "both", k = k.pen) 
+
+summary(fit)
+fit$anova
+fit.both <- fit
+.five.fit.stats(fit.both)
+```
+
+#### Comparisons
+
+```{r}
+AIC(object = fit.null, k = k.pen)
+AIC(object = fit.full, k = k.pen)
+#AIC(object = fit.forw, k = k.pen)
+#AIC(object = fit.back, k = k.pen)
+AIC(object = fit.both, k = k.pen)
+```
+
+### Regularized Regression
+
+```{r}
+y <- data.train$VAR38
+
+xmat <- .glmnet.xmat(formula = formula(fit.full), data=data.train)
+
+print(dim(xmat))
+
+lambda.all <- exp(seq(from = -10, to = 7, by = .2))
+
+```
+
+#### Ridge
+
+```{r}
+alphar <- 0 
+fit <- glmnet(x = xmat, y = y, family = "binomial", lambda = lambda.all,
+  standardize = TRUE, alpha = alphar)
+
+fit.ridge.all <- fit
+
+
+##GRAPHS
+par(mfrow = c(1,1))
+plot(x = fit.ridge.all, xvar="lambda", label=TRUE)  ## lambda
+plot(x = fit.ridge.all, xvar = "norm",   label = TRUE) ## L1-norm
+plot(x = fit.ridge.all, xvar = "dev",    label = TRUE) ## R^2
+
+##LAMBDA SELECTION
+cvfit <- cv.glmnet(x = xmat, y = y, alpha = alphar, lambda = lambda.all,
+  family = "binomial", type.measure = "deviance", nfolds = 20)
+par( mfrow = c(1,1) )
+plot(cvfit)
+
+cat("min(lambda) = ", cvfit$lambda.min, "1se(lambda) = ", cvfit$lambda.1se, "\n")
+
+##FITTING WITH THE BEST LAMBDA
+lambda <- cvfit$lambda.1se
+fit <- glmnet(x = xmat, y = y, family = "binomial", alpha = alphar,
+  lambda = lambda, standardize = TRUE)
+
+lambda.ridge <- lambda
+fit.ridge <- fit
+```
+
+#### Lasso
+
+```{r}
+alpha <- 1 
+fit <- glmnet(x = xmat, y = y, family = "binomial", lambda = lambda.all, standardize = TRUE, alpha = alpha)
+
+fit.lasso.all <- fit
+
+par(mfrow = c(1,1))
+plot(x = fit, xvar = "lambda", label = TRUE, main="Lasso")
+
+cvfit <- cv.glmnet(x = xmat, y = y, alpha = alpha, lambda = lambda.all,   family = "binomial", type.measure = "deviance", nfolds = 20)
+
+par( mfrow = c(1,1) ) 
+plot(cvfit)
+
+cat("min(lambda) = ", cvfit$lambda.min, "1se(lambda) = ", cvfit$lambda.1se, "\n")
+
+lambda <- cvfit$lambda.1se
+fit <- glmnet(x = xmat, y = y, family = "binomial", alpha= alpha, lambda = lambda, standardize = TRUE)
+lambda.lasso <- lambda
+fit.lasso <- fit
+```
+
+#### Elastic net
+
+```{r}
+alphaen <- 0.5
+
+fit <- glmnet(x = xmat, y = y, family = "binomial", lambda = lambda.all,
+  standardize = TRUE, alpha = alphaen)
+
+fit.enet.all <- fit 
+
+##GRAPHS
+par(mfrow=c(1,1))
+plot(x = fit.enet.all, xvar = "lambda", label = TRUE, main = "Elastic net")
+plot(x = fit.enet.all, xvar = "norm",   label = TRUE) 
+
+##LAMBDA SELECTION
+cvfit <- cv.glmnet(x = xmat, y = y, alpha = alphaen, lambda = lambda.all,
+  family = "binomial", type.measure = "deviance", nfolds = 20)
+par( mfrow = c(1,1) )
+plot(cvfit)
+
+cat("min(lambda) = ", cvfit$lambda.min, "1se(lambda) = ", cvfit$lambda.1se, "\n")
+
+##FITTING WITH THE BEST LAMBDA
+lambda <- cvfit$lambda.1se
+fit <- glmnet(x = xmat, y = y, family = "binomial", alpha = alphaen,
+  lambda = lambda, standardize = TRUE)
+
+lambda.enet <- lambda
+fit.enet <- fit
+```
+
+## RPART
+
+```{r}
+control <- rpart.control(minsplit = 10, minbucket = 5, cp = 0, xval = 10, maxdepth = 30)
+
+prob1 <- mean(data.train$VAR38)
+parms <- list(prior = c(1 - prob1, prob1), 
+  loss = matrix(c(0,1,1,0),2,2),
+  split = "gini")
+
+fit <- rpart(formula = form.full, data = data.train, control = control,
+  method = "class", parms = parms)
+
+
+fitRpart <- fit
+
+```
+
+```{r}
+
+cp.threshold <- .rpart.cp.1se(fit = fitRpart)
+cp.threshold
+
+fit <- prune(tree = fitRpart, cp = cp.threshold)
+printcp(fit)
+par(mfrow = c(1,1), mar = c(4.5, 4.5, 4.5, 1))
+.plotcp(fit)
+par(mfrow = c(1,1), mar = c(0.2, 0.2, 0.2, 0.2))
+fancyRpartPlot(fit, caption = NULL, type = 4)
+
+fit2Rpart <- fit
+```
+
+## BAGGING
+
+```{r}
+#data.train$VAR38 <- factor(x=data.train$VAR38)
+
+formula <- VAR38f ~ VAR5 + VAR17 + VAR29 + VAR4 + VAR32 + VAR1 + VAR6 + VAR7 + VAR9 + VAR10 + VAR13 + VAR14 + VAR15 + VAR16 + VAR18 + VAR19 + VAR21 + VAR22 + VAR24 + VAR25 + VAR26 + VAR27 + VAR31 + VAR33 + VAR34 + VAR36 + VAR37
+
+feat <- .features(x = formula)
+```
+
+```{r}
+fit <- ranger(formula = formula, data = data.train, 
+  probability = TRUE, splitrule = "gini", importance = "impurity", 
+  num.trees = 1000, mtry = NROW(feat),
+  min.node.size = 5, min.bucket = 1, max.depth = NULL,
+  keep.inbag = TRUE, oob.error = TRUE, verbose = TRUE, seed = 2000)
+
+fit.bagging <- fit
+```
+
+```{r}
+
+.rf.errorMeasures(fit=fit.bagging, data=data.train)
+type <- "brier" 
+par(mfrow=c(2,1), mar=c(4,4,1,0.2))
+error.cum <- .rf.errorPlot(fit=fit.bagging, data=data.train, type=type, what="all") 
+error.cum1 <- .rf.errorPlot(fit=fit.bagging, data=data.train, type=type, what="oob") 
+
+
+par(mar = c(4, 9, 0.5, 0.5))
+vimp <- .rf.varImp(fit = fit, plot = TRUE)
+```
+
+## Random Forest
+
+```{r}
+mtry <- sqrt(NROW(feat))
+
+fit <- ranger(formula = formula, data = data.train, 
+  probability = TRUE, splitrule = "gini", importance = "impurity", 
+  num.trees = 1000, mtry = mtry,
+  min.node.size = 5, min.bucket = 1, max.depth = NULL,
+  keep.inbag = TRUE, oob.error = TRUE, verbose = TRUE, seed = 2000)
+
+fit.forest <- fit
+
+.rf.errorMeasures(fit = fit.forest, data = data.train)
+
+par(mfrow = c(2,1), mar = c(5,4,1,0.2))
+type <- "brier"
+error.cum <- .rf.errorPlot(fit = fit.forest, data = data.train, type = type,
+  what = c("all"))
+error.cum <- .rf.errorPlot(fit = fit.forest, data = data.train, type = type,
+  what = c("oob"))
+
+par(mar = c(4, 9, 7.5, 3.2))
+vimp <- .rf.varImp(fit = fit.bagging, plot = TRUE)
+```
+
+## Model performance evaluation (probability based)
+
+```{r}
+y <- data.test$VAR38
+
+form <- formula(fit.full)
+xmat <- model.matrix(object = form, data = data.test)[, -1, drop = FALSE]
+print(dim(xmat))
+
+fit.stats <- rbind(
+  Mfull = .fit.stats.bin(fit = fit.full, y = y, x = data.test),
+  Mboth = .fit.stats.bin(fit = fit.both, y = y, x = data.test),
+  Mridge = .fit.stats.bin(fit = fit.ridge, y = y, x = xmat),
+  Mlasso = .fit.stats.bin(fit = fit.lasso, y = y, x = xmat),
+  Menet = .fit.stats.bin(fit = fit.enet, y = y, x = xmat))
+  
+  fit.stats2 <- rbind(
+    Mbag = .fit.stats.bin(fit = fit.bagging, y = y, x = data.test),
+  MRF = .fit.stats.bin(fit = fit.forest, y = y, x = data.test),
+  Mpart1 = .fit.stats.bin(fit = fitRpart, y = y, x = data.test),
+   Mrpart2 = .fit.stats.bin(fit = fit2Rpart, y = y, x = data.test))
+  
+fit.stats
+fit.stats2
+
+```
+
+## Model performance evaluation: ROC curve
+
+```{r}
+y.test <- data.test$VAR38
+xmat2 <- .glmnet.xmat(formula = form.full, data = data.test)
+print(dim(xmat2))
+
+xmat <- .glmnet.xmat(formula = form.full, data = data.train)
+print(dim(xmat))
+
+#xmat2 <- model.matrix(object = form.full, data = data.test)[, -1] 
+#print(dim(xmat2))
+```
+
+```{r}
+#### PREDICTIONS ON TEST DATA
+
+#Full Model
+pred.full <- predict(object = fit.full, newdata = data.test, type = "response")
+
+#Both
+pred.both <- predict(object = fit.both, newdata  = data.test, type = "response")
+
+#Elastic net
+pred.enet <- predict(object=fit.enet, newx = xmat2, type="response")
+
+#RPart
+pred2Rpart <- predict(object = fit2Rpart, newdata =  data.test, type = "prob")[, "1"]
+
+pred <- cbind(full = pred.full, both = pred.both,enet=pred.enet, Rpart2=pred2Rpart)
+
+#### Plot 1: (Full, Lasso, RPart2)
+roc <- roc.plot(x = y.test, pred = pred,
+  xlab = "False Positive Rate", ylab = "True Positive Rate",
+  show.thres = FALSE, legend = TRUE, leg.text = c("Full", "Both","Elastic Net", "RPart2"))
+
+roc$roc.vol
+```
+
+```{r}
+#Bagging
+pred.bagging <- predict(object=fit.bagging, data=data.test, type = "response")$predictions[,"1"]
+
+#Random Forest
+pred.forest <- predict(object = fit.forest, data = data.test, type = "response")$predictions[,"1"]
+
+pred1 <- cbind(bagging=pred.bagging, RandForest=pred.forest)
+
+#### Plot 2
+roc2 <- roc.plot(x=y.test, pred=pred1,xlab = "False Positive Rate", ylab = "True Positive Rate",show.thres = FALSE, legend = TRUE, leg.text = c("Bagging", "Random Forest"))
+roc2$roc.vol
+```
+
+## Cut-off selection
+
+```{r}
+
+y <- data.train$VAR38
+yt <- as.numeric(as.character(y))
+prop1 <- mean(yt)
+
+pred.full.train <- predict(object = fit.bagging , data=data.train, type="response")$predictions[, "1"]
+
+# 2Average rule
+coff.2 <- prop1     
+class.av <- .classify(x = pred.full.train, coff = coff.2)
+class.av
+# 3Quantile rule
+coff.3 <- quantile(x = fitted(fit.bagging), prob = 1 - prop1)
+coff.3
+class.qn <- .classify(x = pred.full.train, coff = coff.3)
+class.qn
+# 4Cost based rule
+coff.4 <- .cost.cutoff(c01 = 5, c10 = 1, c00 = 0, c11 = 0)
+coff.4
+class.cost <- .classify(x = pred.full.train, coff = coff.4)
+class.cost
+# 5Yuden point
+coff.5 <- .yuden.coff(x = yt, pred =pred.full.train)$coff
+coff.5
+class.yuden <- .classify(x = pred.full.train, coff=coff.5)
+class.yuden
+```
+
+Compare the 0/1 proportions in the data with those coming from model classifications.
+
+```{r}
+rbind(
+  data.train  = prop.table(table(yt, exclude = NULL)),
+  class.av    = prop.table(table(class.av, exclude = NULL)),
+  class.qn    = prop.table(table(class.qn, exclude = NULL)),
+  class.cost  = prop.table(table(class.cost, exclude = NULL)),
+  class.yuden = prop.table(table(class.yuden, exclude = NULL)) )
+ 
+```
+
+Set the cut-off value to be used for predictions.
+
+```{r}
+yuden <- .yuden.coff(x = yt, pred = pred.full.train)
+yuden
+coff.sel <- yuden$coff
+coff.sel
+#coff.sel <- .cost.cutoff(c01 = 5, c10 = 1, c00 = 0, c11 = 0)
+#coff.sel
+```
+
+## Model performance evaluation (classification based)
+
+I use only bagging model.
+
+```{r}
+#### Test data
+data <- data.test
+y <- data$VAR38
+#### Predictions
+fit <- fit.bagging
+pred <- predict(object = fit, data = data, type = "response")$predictions[, "1"]
+head(pred)
+coff.sel
+class <- .classify(x = pred, coff = coff.sel)
+```
+
+Confusion matrix.
+
+```{r}
+#### Original
+cmat <- table(class = class, true = y, exclude = NULL)
+cmat
+#### Proportions (conditionally on the classification)
+prop.table(cmat, margin = 1)
+#### A different way to calculate the confusion matrix with some statistics added
+cmat.s <- confusionMatrix(
+    data = as.factor(class), reference = as.factor(y),
+  positive = "1")
+cmat.s
+```
+
+## Prediction on live data
+
+```{r}
+##   Settings
+formula <- VAR38f ~ VAR5 + VAR17 + VAR29 + VAR4 + VAR32 + VAR1 + VAR6 + VAR7 + VAR9 + VAR10 + VAR13 + VAR14 + VAR15 + VAR16 + VAR18 + VAR19 + VAR21 + VAR22 + VAR24 + VAR25 + VAR26 + VAR27 + VAR31 + VAR33 + VAR34 + VAR36 + VAR37
+
+feat <- .features(x = formula)
+
+fit.fin <- fit.bagging
+data <- data.orig
+##   Model fitting
+fit.fin <- ranger(formula = formula, data = data,
+  num.trees = 2000, mtry = fit$mtry,
+  probability = TRUE,
+  min.node.size = fit$min.node.size, min.bucket = 1, max.depth = NULL,
+  importance = fit$importance.mode, splitrule = fit$splitrule,
+  keep.inbag = TRUE, oob.error = TRUE, verbose = TRUE, seed = 2000)
+```
+
+Predict probability.
+
+```{r}
+pred.fin <- predict(object = fit.fin, data = data.live, type = "response")$predictions[, "1"]
+#pred.fin
+#coff.sel
+#mean(data$VAR38)
+
+```
+
+Convert to classification.
+
+```{r}
+class <- .classify(x = pred.fin, coff = coff.sel)
+class
+mean(class)
+```
+
+Save.
+
+```{r}
+### Append predictions to live data
+pred <- data.frame(data.live, pred = pred.fin, class = class, check.names = FALSE)
+#### Write on a file
+file <- "C:/Users/franc/OneDrive/Documenti/Francesco Lassi UniFi/Economics/Terzo anno Economics- Erasmus/Secondo semestre/Data Science for Economics/LassiFrancesco Data Report/Data-livePredictions.txt"
+write.table(x = pred, file = file, quote = FALSE, sep = "\t",
+  na = ".", row.names = FALSE, col.names = TRUE)
+```
