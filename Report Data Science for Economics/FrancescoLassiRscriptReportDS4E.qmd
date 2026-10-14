@@ -37,7 +37,7 @@ library(gbm)
 library(xgboost)          
 
 #### Load functions
-source("C:/Users/franc/OneDrive/Documenti/Francesco Lassi UniFi/Economics/Terzo anno Economics- Erasmus/Secondo semestre/Data Science for Economics/R/DS4E-Functions.R")
+source("data/Data-original.txt")
 
 ## Some functions
 #1)
